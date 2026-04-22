@@ -31,4 +31,6 @@ jobs:
       - name: Push notification
         if: always()
         run: |
-          curl -s "https://api.day.app/8kSTPbxDxoRtzezBT84nQj/VPS任务完成/任务已于$(date '+%Y-%m-%d %H:%M:%S')执行完成"
+          TITLE=$(python3 -c "import urllib.parse; print(urllib.parse.quote('VPS任务完成'))")
+          CONTENT=$(python3 -c "import urllib.parse; print(urllib.parse.quote('任务已于$(date +%Y-%m-%d\ %H:%M:%S)执行完成'))")
+          curl -s "https://api.day.app/8kSTPbxDxoRtzezBT84nQj/${TITLE}/${CONTENT}"
