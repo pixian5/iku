@@ -3,11 +3,14 @@
 
 import asyncio
 import base64
+import hashlib
+import json
 import os
 import random
 import re
 import sys
 from datetime import datetime
+from pathlib import Path
 
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
@@ -21,6 +24,9 @@ DOMAIN_CANDIDATES = [
     'https://ikuuu.me',
     'https://ikuuu.uk',
 ]
+
+# Cookies 存储目录
+COOKIES_DIR = Path(__file__).parent / 'cookies'
 
 
 def send_bark(title: str, content: str):
@@ -48,6 +54,48 @@ def send_bark(title: str, content: str):
         print('[Bark]: Message push successful!')
     except Exception as e:
         print(f'[Bark]: Message push failed! Reason: {str(e)}')
+
+
+def get_cookies_path(email: str) -> Path:
+    """获取账号对应的 cookies 文件路径"""
+    COOKIES_DIR.mkdir(exist_ok=True)
+    # 用邮箱的 hash 作为文件名，避免路径问题
+    email_hash = hashlib.md5(email.encode()).hexdigest()[:16]
+    return COOKIES_DIR / f'{email_hash}.json'
+
+
+def save_cookies(email: str, cookies: list, base_url: str):
+    """保存 cookies 到文件"""
+    cookies_path = get_cookies_path(email)
+    data = {
+        'cookies': cookies,
+        'base_url': base_url,
+        'saved_at': datetime.now().isoformat(),
+    }
+    with open(cookies_path, 'w') as f:
+        json.dump(data, f)
+    print(f'[Cookies] 已保存登录状态')
+
+
+def load_cookies(email: str) -> tuple:
+    """加载 cookies，返回 (cookies, base_url) 或 (None, None)"""
+    cookies_path = get_cookies_path(email)
+    if not cookies_path.exists():
+        return None, None
+    try:
+        with open(cookies_path, 'r') as f:
+            data = json.load(f)
+        # 检查是否过期（超过7天）
+        saved_at = datetime.fromisoformat(data['saved_at'])
+        if (datetime.now() - saved_at).days > 7:
+            print(f'[Cookies] 登录状态已过期')
+            cookies_path.unlink()
+            return None, None
+        print(f'[Cookies] 发现已保存的登录状态')
+        return data['cookies'], data['base_url']
+    except Exception as e:
+        print(f'[Cookies] 加载失败: {e}')
+        return None, None
 
 
 class ikuuu:
@@ -117,6 +165,19 @@ class ikuuu:
             except Exception:
                 continue
         raise RuntimeError('未找到可用的 ikuuu 登录域名')
+
+    async def check_login_status(self, page) -> bool:
+        """检查是否已登录"""
+        try:
+            user_url = f'{self.base_url}/user'
+            await page.goto(user_url, wait_until='domcontentloaded', timeout=15000)
+            content = await page.content()
+            # 如果页面包含签到相关内容，说明已登录
+            if '签到' in content or '剩余流量' in content or 'checkin' in content.lower():
+                return True
+            return False
+        except Exception:
+            return False
 
     async def sign_with_playwright(self, page):
         """使用 Playwright 执行签到"""
@@ -212,8 +273,6 @@ class ikuuu:
 
     async def sign(self):
         """签到主流程"""
-        print(f"[INFO] 尝试 Playwright 自动登录并签到...")
-
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=True,
@@ -233,6 +292,23 @@ class ikuuu:
             page = await context.new_page()
 
             try:
+                # 尝试加载已保存的 cookies
+                saved_cookies, saved_base_url = load_cookies(self.email)
+
+                if saved_cookies and saved_base_url:
+                    # 添加已保存的 cookies
+                    await context.add_cookies(saved_cookies)
+                    self.base_url = saved_base_url
+
+                    # 检查是否仍然有效
+                    if await self.check_login_status(page):
+                        print(f'[INFO] 使用已保存的登录状态，跳过登录')
+                        await self.sign_with_playwright(page)
+                        await browser.close()
+                        return
+                    else:
+                        print(f'[INFO] 登录状态已失效，重新登录')
+
                 # 检测可用域名
                 try:
                     await self.resolve_base_url(page)
@@ -274,6 +350,15 @@ class ikuuu:
                 except:
                     pass
 
+                # 点击记住登录状态
+                remember_xpath = '//*[@id="app"]/section/div/div/div/div[2]/form/div/div[5]/div'
+                try:
+                    await page.click(f'xpath={remember_xpath}', timeout=5000)
+                    print(f'[Playwright] 已点击记住登录状态')
+                    await page.wait_for_timeout(1000)
+                except:
+                    pass
+
                 # 点击登录按钮
                 login_xpath = '//*[@id="app"]/section/div/div/div/div[2]/form/div/div[6]/button'
                 await page.click(f'xpath={login_xpath}', timeout=5000)
@@ -288,6 +373,10 @@ class ikuuu:
                     return
 
                 print(f'[Playwright] 登录成功，当前URL: {current_url}')
+
+                # 保存登录状态
+                cookies = await context.cookies()
+                save_cookies(self.email, cookies, self.base_url)
 
                 await self.sign_with_playwright(page)
 
